@@ -1,0 +1,175 @@
+### Trimming BS-seq reads using Trim Galore (trim_galore/0.6.7)
+
+#!/bin/bash -l
+#sbatch -N 1  -n 36  --mem 128gb --out logs/bwa.%a.log --time 8:00:00
+
+cd $SLURM_SUBMIT_DIR
+
+module load trim_galore/0.6.7
+
+# Define the folder containing the input files and the new output directory
+INPUT_FOLDER="input"
+NEW_OUTPUT_FOLDER="/rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/trim_galore_results_new"
+
+# Create the new output directory if it doesn't exist
+mkdir -p $NEW_OUTPUT_FOLDER
+
+# Read the sample information from the CSV file for the current array task
+IFS=',' read SAMPLE FORWARD REVERSE < <(sed -n "${SLURM_ARRAY_TASK_ID}p" samples.csv)
+
+# Define the full paths to the input files
+FORWARD_PATH="${INPUT_FOLDER}/${FORWARD}"
+REVERSE_PATH="${INPUT_FOLDER}/${REVERSE}"
+
+# Default CPU value
+CPU=2
+
+# Check if SLURM_CPUS_ON_NODE is set and use it
+if [ ! -z "$SLURM_CPUS_ON_NODE" ]; then
+  CPU=$SLURM_CPUS_ON_NODE
+fi
+
+# Check if SLURM_ARRAY_TASK_ID is set
+if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
+  echo "Cannot run without SLURM_ARRAY_TASK_ID"
+  exit 1
+fi
+
+echo "Using $CPU CPUs for task ${SLURM_ARRAY_TASK_ID}"
+
+# Run trim_galore for the current sample
+trim_galore --clip_r1 25 --clip_r2 25 --three_prime_clip_R1 20 --three_prime_clip_R2 20 --cores $CPU --paired --length 80 -q 20  -o $NEW_OUTPUT_FOLDER ${FORWARD_PATH} ${REVERSE_PATH}
+
+
+
+
+### Checking read quality and statistics using fastQC (fastqc/0.11.9)
+
+#!/bin/bash -l
+#sbatch -N 1 -n 36 --mem 128gb -p intel --array=1-36 --out logs/bwa.%a.log --time 4:00:00
+#SBATCH --mail-user=wcoll010@ucr.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name="fastqc_reads"
+#SBATCH --array=1-36
+#SBATCH -p intel
+
+CPU=2
+if [ $SLURM_CPUS_ON_NODE ]; then
+  CPU=$SLURM_CPUS_ON_NODE
+fi
+
+N=${SLURM_ARRAY_TASK_ID}
+if [ -z $N ]; then
+  N=$1
+fi
+
+if [ -z $N ]; then
+  echo "cannot run without a number provided either cmdline or --array in sbatch"
+  exit
+fi
+
+module load fastqc/0.11.9
+
+# Define the folder containing the input files and the new output directory
+INPUT_FOLDER="./trim_galore_results_new"
+NEW_OUTPUT_FOLDER="./trim_galore_results_new/fastqc_results"
+
+# Create the new output directory if it doesn't exist
+mkdir -p $NEW_OUTPUT_FOLDER
+
+# Get the list of all fastq.gz files in the input folder
+trimmed_reads=($(ls $INPUT_FOLDER/*.fastq.gz))
+
+# Calculate the total number of files
+total_files=${#trimmed_reads[@]}
+
+# Check if SLURM_ARRAY_TASK_ID is within the range of the number of files
+if [ $SLURM_ARRAY_TASK_ID -le $total_files ]; then
+    # Get the current file to process based on the array task ID
+    current_file=${trimmed_reads[$((SLURM_ARRAY_TASK_ID-1))]}
+
+    # Run fastqc on the current file
+    fastqc -t $CPU $current_file -o $NEW_OUTPUT_FOLDER
+else
+    echo "Array task ID $SLURM_ARRAY_TASK_ID exceeds the number of files to process."
+    exit 1
+fi
+
+
+
+### Aligning reads to the reference genome using Bismark (bismark/0.24.1)
+
+## Genome preparation step; this code indexes the reference genome fasta and converts it to a BS treated version (C to T)
+module load bismark/0.24.1
+bismark_genome_preparation --verbose ./data/genomes/dv/
+
+## Genome alignment step
+
+#!/bin/bash -l
+#SBATCH --nodes=1
+#SBATCH --ntasks=20
+#SBATCH --cpus-per-task=2
+#SBATCH --mem 128gb
+#SBATCH --time=48:00:00
+#SBATCH --output=logs/bismark_%A_%a.txt
+#SBATCH --mail-user=wcoll010@ucr.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name="bismark_alignment_0806"
+#SBATCH -p epyc
+#SBATCH --array=1-20
+
+module load bismark/0.24.1
+
+# Define the folder containing the input files
+INPUT_FOLDER="./trim_galore_results_new"
+OUTPUT_FOLDER="./bismark_results_new"
+GENOME_FOLDER="./data/genomes/dv"
+
+# Create output directory if it doesn't exist
+mkdir -p $OUTPUT_FOLDER
+
+# Read the sample information from the CSV file
+IFS=',' read -r SAMPLE FORWARD REVERSE < <(sed -n "${SLURM_ARRAY_TASK_ID}p" samples_trimmed.csv)
+
+# Define the full paths to the input files
+FORWARD_PATH="${INPUT_FOLDER}/${FORWARD}"
+REVERSE_PATH="${INPUT_FOLDER}/${REVERSE}"
+
+# Create output directory for the sample if it doesn't exist
+SAMPLE_OUTPUT_DIR="${OUTPUT_FOLDER}/${SAMPLE}"
+mkdir -p $SAMPLE_OUTPUT_DIR
+
+# Run bismark for the current sample using all available CPUs
+bismark -q -p $SLURM_CPUS_PER_TASK -N 1 -o $SAMPLE_OUTPUT_DIR $GENOME_FOLDER -1 $FORWARD_PATH -2 $REVERSE_PATH
+
+
+
+## Bismark deduplication step
+
+module load bismark/0.24.1
+
+# Define input files
+input_files=(
+    "./G1_1/hq_trimmed_80bp_G1_1_S2_L003_1_bismark_bt2_pe.bam"
+    "./G1_2/hq_trimmed_80bp_G1_2_S3_L003_1_bismark_bt2_pe.bam"
+    "./G1_3/hq_trimmed_80bp_G1_3_S4_L003_1_bismark_bt2_pe.bam"
+    "./G1_4/hq_trimmed_80bp_G1_4_S5_L003_1_bismark_bt2_pe.bam"
+    # Add more input files as needed
+)
+
+# Loop over input files
+for file in "${input_files[@]}"; do
+    # Define output file name by adding "_dedup" suffix
+    output_file="${file%.bam}_dedup.bam"
+    
+    # Deduplicate each input file
+    deduplicate_bismark -p --bam --parallel 4 "$file" -o "$output_file"
+done
+
+
+
+## Bismark methylation extraction step
+
+module load bismark/0.24.1
+bismark_methylation_extractor -p --no_overlap --comprehensive --multicore 4 --scaffolds --buffer_size 20G --bedGraph --counts --gzip sample_name.bam
+
