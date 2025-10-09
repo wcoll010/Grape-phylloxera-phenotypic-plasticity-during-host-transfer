@@ -1,77 +1,158 @@
-### Filter CpG methylation data (after bismark alignment) then perform PCA
+### Filter CpG methylation data (after bismark alignment), perform binomial test, then perform PCA
 
-# Directory containing final filtered coverage files
-# Each file is a tab-delimited table of CpG sites with methylation calls
+# Set working directory
+cd ~/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/filtered_coverage
+
+# Initiate non-interactive bash session
+srun -p highmem --mem=100g --cpus-per-task 4 --time=02:00:00 --pty bash -l
+
+
+## Step 1: Identify CpG sites covered by ≥4 reads in ALL 28 samples
+
+# Process all coverage files and extract CpG sites with ≥4 total reads
+for file in *bismark.cov.gz; do
+  zcat "$file" | awk '{if ($5 + $6 >= 4) print $1, $2}' > "sites_with_4_reads_${file%.gz}.txt"
+done
+
+# Sort each site list (join requires sorted input)
+for file in sites_with_4_reads_*.txt; do
+  sort "$file" > "sorted_$file"
+done
+
+# Concatenate all sorted files
+cat sorted_sites_with_4_reads_*.txt > temp_common.txt
+
+# Extract scaffold/start and sort
+cut -f 1,2 temp_common.txt | sort > sorted_temp_common.txt
+
+
+# Remove the count and keep only scaffold/start
+awk '{print $2, $3}' common_sites_all_samples.txt > cleaned_common_sites_all_samples.txt
+
+# Sort by scaffold and start
+sort -k1,1 -k2,2n cleaned_common_sites_all_samples.txt > sorted_common_sites_all_samples.txt
+
+# Make tab-delimited
+awk '{$1=$1}1' OFS="\t" sorted_common_sites_all_samples.txt > sorted_common_sites_all_samples_tab.txt
+
+# Test one file (optional sanity check)
+zcat /rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/PE2_1_val_1_bismark_bt2_pe_dedup.deduplicated.bismark.cov.gz \
+  | grep -F -f sorted_common_sites_all_samples_tab.txt
+
+# Filter original files to retain only CpG sites covered by ≥4 reads in all samples
+for file in *bismark.cov.gz; do
+  zcat "$file" | grep -F -f sorted_common_sites_all_samples_tab.txt | gzip > "filtered_$(basename "$file")"
+done
+
+
+
+## Step 2: Remove CpG sites with 0% methylation (for binomial testing)
+
+for file in /rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/filtered_cov_files/*.bismark.cov.gz; do
+    output_file="filtered_nonzero_$(basename "$file")"
+    zcat "$file" | awk '$4 > 0' | gzip > "$output_file"
+    echo "Processed: $file -> $output_file"
+done
+
+
+## Step 3: Perform binomial test for significant methylation (in R)
+
+# Activate R
+R
+
+library(stats)
+
+# Define sequencing error rate from lambda control
+p_err <- 0.003  
+
 input_dir <- "/rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/filtered_cov_files/"
-
-# List all filtered coverage files to include in the PCA
-# Pattern ensures we only select files beginning with "filtered_" and ending with ".bismark.cov.gz"
-files <- list.files(input_dir, pattern = "^filtered_.*\\.bismark\\.cov\\.gz$", full.names = TRUE)
-
-
-#-------------------------------------------------------
-## Read and prepare methylation percentage data
-
-data_list <- list()
+output_dir <- input_dir
+files <- list.files(input_dir, pattern = "^filtered_nonzero_.*\\.bismark\\.cov\\.gz$", full.names = TRUE)
 
 for (file in files) {
-  # Extract sample name from file name (remove prefix and suffix)
+  data <- read.table(file, header=FALSE)
+  colnames(data) <- c("scaffold", "start", "stop", "methylation_percent", "methylated_reads", "unmethylated_reads")
+
+  data$p_value <- apply(data, 1, function(row) {
+    binom.test(as.numeric(row["methylated_reads"]),
+               as.numeric(row["methylated_reads"]) + as.numeric(row["unmethylated_reads"]),
+               p = p_err, alternative = "greater")$p.value
+  })
+
+  data$adj_p_value <- p.adjust(data$p_value, method = "BH")
+  sig_methylated <- data[data$adj_p_value < 0.001, ]
+
+  output_file <- paste0(output_dir, "significant_methylated_", basename(file), "_adjp001.txt")
+  write.table(sig_methylated, output_file, sep="\t", row.names=FALSE, quote=FALSE)
+  cat("Processed:", file, "->", output_file, "\n")
+}
+
+
+## Step 4: Filter coverage files to include only CpGs significant in ≥1 sample (in R)
+
+# Activate R
+R
+
+input_dir <- "/rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/filtered_cov_files/"
+output_dir <- input_dir
+
+sig_CpGs <- read.table(
+  "/rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/filtered_cov_files/unique_significant_CpGs.txt",
+  header=TRUE, sep="\t", stringsAsFactors=FALSE
+)
+sig_CpGs$start <- as.numeric(sig_CpGs$start)
+
+files <- list.files(input_dir, pattern = "^filtered_.*\\.bismark\\.cov\\.gz$", full.names = TRUE)
+
+for (file in files) {
+  data <- read.table(file, header=FALSE, sep="\t", stringsAsFactors=FALSE)
+  colnames(data) <- c("scaffold", "start", "stop", "methylation_percent", "methylated_reads", "unmethylated_reads")
+  data$start <- as.numeric(data$start)
+  
+  filtered_data <- merge(data, sig_CpGs, by=c("scaffold", "start"))
+  output_file <- paste0(output_dir, basename(file))
+  write.table(filtered_data, output_file, sep="\t", row.names=FALSE, quote=FALSE, col.names=FALSE)
+  cat("Filtered file saved:", output_file, "\n")
+}
+
+
+## Step 5: Perform PCA of CpG methylation (in R)
+
+# Activate R
+R
+
+library(ggplot2)
+library(RColorBrewer)
+library(dplyr)
+library(ggforce)
+
+input_dir <- "/rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/filtered_cov_files/"
+files <- list.files(input_dir, pattern = "^filtered_.*\\.bismark\\.cov\\.gz$", full.names = TRUE)
+
+data_list <- list()
+for (file in files) {
   sample_name <- gsub("^filtered_|\\.bismark\\.cov\\.gz$", "", basename(file))
-  
-  # Read coverage file: scaffold, start, stop, methylation %, methylated reads, unmethylated reads
-  data <- read.table(file, header = FALSE, sep = "\t", stringsAsFactors = FALSE)
-  colnames(data) <- c("scaffold", "start", "stop", "methylation_percent",
-                      "methylated_reads", "unmethylated_reads")
-  
-  # Keep only scaffold, position, and methylation percentage
+  data <- read.table(file, header=FALSE, sep="\t", stringsAsFactors=FALSE)
+  colnames(data) <- c("scaffold", "start", "stop", "methylation_percent", "methylated_reads", "unmethylated_reads")
   data <- data[, c("scaffold", "start", "methylation_percent")]
-  
-  # Rename methylation column to the sample name (for later merging)
   colnames(data)[3] <- sample_name
-  
-  # Store each sample’s data frame in a list for merging
   data_list[[sample_name]] <- data
 }
 
-# Merge all sample data frames by scaffold and start position to create a single matrix
-merged_data <- Reduce(function(x, y) merge(x, y, by = c("scaffold", "start"), all = TRUE), data_list)
-
-# Convert methylation percentages to a numeric matrix (remove scaffold and start columns)
+merged_data <- Reduce(function(x, y) merge(x, y, by=c("scaffold", "start"), all=TRUE), data_list)
 meth_matrix <- as.matrix(merged_data[, -c(1,2)])
-
-# Remove CpG rows with any missing values across samples
 meth_matrix_final <- na.omit(meth_matrix)
 
-
-
-### Filter for variable CpG sites
-
-# Calculate variance across samples for each CpG site
 row_variance <- apply(meth_matrix_final, 1, var)
-
-# Keep only sites with non-zero variance (informative for PCA)
 meth_matrix_filtered <- meth_matrix_final[row_variance != 0, ]
 
-
-
-
-#--------------------------------------------
-### Perform Principal Component Analysis (PCA)
-
-# Transpose matrix so that rows = samples, columns = CpG sites
-# Center and scale so all CpG sites contribute equally
-pca_result <- prcomp(t(meth_matrix_filtered), center = TRUE, scale. = TRUE)
-
-# Calculate percentage of variance explained by the first two PCs
+pca_result <- prcomp(t(meth_matrix_filtered), center=TRUE, scale.=TRUE)
 percent_var <- (pca_result$sdev^2 / sum(pca_result$sdev^2)) * 100
 pc1_var <- round(percent_var[1], 2)
 pc2_var <- round(percent_var[2], 2)
 
-# Create a data frame of PCA scores for plotting
 pca_df <- as.data.frame(pca_result$x)
 pca_df$Sample <- rownames(pca_df)
-
-# Assign treatment group labels based on sample name patterns
 pca_df$Group <- factor(ifelse(grepl("^S4_", pca_df$Sample), "GS04",
                        ifelse(grepl("^PE", pca_df$Sample), "G0_Cabb33(egg)",
                        ifelse(grepl("^PA", pca_df$Sample), "G0_Cabb33(adult)",
@@ -80,23 +161,13 @@ pca_df$Group <- factor(ifelse(grepl("^S4_", pca_df$Sample), "GS04",
                        ifelse(grepl("^G1_", pca_df$Sample), "G1_Cabb33",
                        ifelse(grepl("^9R_", pca_df$Sample), "G99R", "Other"))))))))
 
-
-
-#-------------------------------------
-### Plot the PCA
- 
-# Choose color scheme for the treatment groups
 my_colors <- brewer.pal(7, "Dark2")
-
-# Generate PCA scatter plot of PC1 vs PC2
-pca_plot <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group)) +
-  geom_point(size = 4) +
-  scale_color_manual(values = my_colors) +
+pca_plot <- ggplot(pca_df, aes(x=PC1, y=PC2, color=Group)) +
+  geom_point(size=4) +
+  scale_color_manual(values=my_colors) +
   labs(title = "PCA of Methylation Data",
        x = paste0("PC1 (", pc1_var, "% variance)"),
        y = paste0("PC2 (", pc2_var, "% variance)")) +
   theme_minimal()
 
-# Save PCA plot to a PDF file
-ggsave("PCA_methylation_plot.pdf", pca_plot, width = 5, height = 4)
-
+ggsave("PCA_methylation_plot.pdf", pca_plot, width=5, height=4)
