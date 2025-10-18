@@ -1,7 +1,7 @@
 ### Determine where in the genome CpG methylation occurs, relative to exons, introns, UTRs, and intergenic space
 
 
-### Step 1: Filter CpG sites with ≥4 reads for PA samples
+### Step 1: Filter CpG sites with ≥4 reads for PA samples (phylloxera adults on Cab33 host, generation 0, 'G0')
 
 # Run an interactive bash session
 srun -p highmem --mem=100g --time=00:30:00 --pty bash -l
