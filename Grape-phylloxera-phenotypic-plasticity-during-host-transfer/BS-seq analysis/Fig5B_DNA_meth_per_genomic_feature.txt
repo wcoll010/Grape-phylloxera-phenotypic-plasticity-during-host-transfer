@@ -1,0 +1,252 @@
+### Determine where in the genome CpG methylation occurs, relative to exons, introns, UTRs, and intergenic space
+
+
+### Step 1: Filter CpG sites with ≥4 reads for PA samples
+
+# Run an interactive bash session
+srun -p highmem --mem=100g --time=00:30:00 --pty bash -l
+
+# Load bedtools
+module load bedtools/2.30.0 
+
+# Create output directories
+mkdir -p filtered_cov temp
+
+# Filter CpG sites with ≥4 reads for each PA sample
+for file in PA*_1_val_1_bismark_bt2_pe_dedup.deduplicated.bismark.cov; do
+    awk '($5 + $6) >= 4' "$file" > "filtered_cov/$(basename "$file" .bismark.cov)_filtered.cov"
+done
+
+# Combine filtered files and retain CpGs covered in all 4 samples
+for file in filtered_cov/PA*_filtered.cov; do
+    awk '{print $1,$2,$3,$5,$6}' "$file" > "temp/$(basename "$file" .cov)_split.cov"
+done
+
+paste temp/*.cov | awk '
+{
+    key = $1"\t"$2"\t"$3
+    meth_sum = $4
+    unmeth_sum = $5
+    total_reads = $4 + $5
+    for (i = 9; i <= NF; i += 5) {
+        meth_sum += $(i)
+        unmeth_sum += $(i+1)
+        total_reads += $(i) + $(i+1)
+    }
+    if (NF / 5 == 4) {
+        print key, meth_sum, unmeth_sum
+    }
+}' > combined_filtered.cov
+
+# Convert to BED format
+awk '{print $1, $2-1, $3, $4, $5}' OFS="\t" combined_filtered.cov > combined_filtered.bed
+
+
+
+### Step 2: Perform binomial test in R to identify significantly methylated CpGs
+
+# Activate R in command line
+R
+
+# Load necessary library
+library(stats)
+
+# Read in coverage data
+data <- read.table("combined_filtered.cov", header = FALSE)
+colnames(data) <- c("scaffold", "start", "stop", "methylated_reads", "unmethylated_reads")
+
+# Define sequencing error rate
+p_err <- 0.003  
+
+# Perform binomial test for each CpG
+data$p_value <- apply(data, 1, function(row) {
+  binom.test(as.numeric(row["methylated_reads"]),
+             as.numeric(row["methylated_reads"]) + as.numeric(row["unmethylated_reads"]),
+             p = p_err, alternative = "greater")$p.value
+})
+
+# Adjust p-values (Benjamini-Hochberg FDR)
+data$adj_p_value <- p.adjust(data$p_value, method = "BH")
+
+# Filter significant CpGs (FDR < 0.001)
+sig_methylated <- data[data$adj_p_value < 0.001, ]
+
+# Save significant CpGs
+write.table(sig_methylated, "significant_methylated_CpGs_001pvalue.txt",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+# Exit R
+<control z>
+
+
+
+### Step 3: Prepare BED files for CpG annotation
+
+# Convert significant CpG text file to BED
+tail -n +2 significant_methylated_CpGs_001pvalue.txt | cut -f1-3 > significant_methylated_CpGs_001pvalue.bed
+
+# Sort BED file
+sort -k1,1 -k2,2n significant_methylated_CpGs_001pvalue.bed > sig_meth_CpGs_001pvalue_sorted.bed
+
+
+
+### Step 4: Extract genomic regions from GFF3 and genome FASTA
+
+module load bedtools/2.30.0
+module load samtools/1.19.2
+
+# Link and index genome
+ln -s /rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/STAR/genome/Dv_genome_V3.1.fa
+samtools faidx Dv_genome_V3.1.fa
+
+# Extract gene and feature coordinates from GFF3
+awk '$3=="gene" {print $1,$4,$5,$9}' OFS="\t" OGS3.2_20180216.gff3 | sort -k1,1 -k2,2n > genes_sorted.bed
+awk '$3=="exon" {print $1,$4,$5,$9}' OFS="\t" OGS3.2_20180216.gff3 | sort -k1,1 -k2,2n > exons_sorted.bed
+awk '$3=="five_prime_UTR" {print $1,$4,$5,$9}' OFS="\t" OGS3.2_20180216.gff3 | sort -k1,1 -k2,2n > five_prime_UTRs_sorted.bed
+awk '$3=="three_prime_UTR" {print $1,$4,$5,$9}' OFS="\t" OGS3.2_20180216.gff3 | sort -k1,1 -k2,2n > three_prime_UTRs_sorted.bed
+awk '$3=="UTR" {print $1,$4,$5,$9}' OFS="\t" OGS3.2_20180216.gff3 | sort -k1,1 -k2,2n > UTRs_sorted.bed
+
+
+
+### Step 5: Annotate CpG sites across genomic features
+
+# Sort CpG file
+sort -k1,1 -k2,2n combined_filtered.bed > combined_filtered_sorted.bed
+
+# Intersect CpGs with features
+bedtools intersect -a combined_filtered_sorted.bed -b genes_sorted.bed -u > cpg_in_genes_NOdups.bed
+bedtools intersect -a combined_filtered_sorted.bed -b exons_sorted.bed -u > cpg_in_exons.bed
+bedtools intersect -a combined_filtered_sorted.bed -b five_prime_UTRs_sorted.bed -u > cpg_in_five_prime_UTRs.bed
+bedtools intersect -a combined_filtered_sorted.bed -b three_prime_UTRs_sorted.bed -u > cpg_in_three_prime_UTRs.bed
+bedtools intersect -a combined_filtered_sorted.bed -b UTRs_sorted.bed -u > cpg_in_UTRs.bed
+
+# Intergenic CpGs
+bedtools subtract -a combined_filtered_sorted.bed -b genes_sorted.bed > cpg_not_in_genes.bed
+
+# Intronic CpGs (genic but not exon or UTR)
+bedtools subtract -a cpg_in_genes_NOdups.bed -b cpg_in_exons.bed -A | \
+bedtools subtract -a - -b cpg_in_UTRs.bed -A | \
+bedtools subtract -a - -b cpg_in_five_prime_UTRs.bed -A | \
+bedtools subtract -a - -b cpg_in_three_prime_UTRs.bed -A > cpg_in_introns.bed
+
+
+
+### Step 6: Count CpGs per feature
+
+echo -e "Feature\tCpG_Count" > cpg_counts.txt
+for file in cpg_in_exons.bed cpg_in_five_prime_UTRs.bed cpg_in_three_prime_UTRs.bed cpg_in_UTRs.bed cpg_in_genes_NOdups.bed cpg_not_in_genes.bed cpg_in_introns.bed
+do
+    count=$(wc -l < "$file")
+    echo -e "$(basename $file)\t$count" >> cpg_counts.txt
+done
+
+
+
+### Step 7: Annotate significant CpGs (p ≤ 0.001)
+
+# Intergenic CpGs
+bedtools subtract -a sig_meth_CpGs_001pvalue_sorted.bed -b genes_sorted.bed > sig_cpg_intergenic.bed
+
+# Genic CpGs
+bedtools intersect -a sig_meth_CpGs_001pvalue_sorted.bed -b genes_sorted.bed -u > sig_cpg_in_genes_NOdups.bed
+
+# Exonic and UTR CpGs
+bedtools intersect -a sig_meth_CpGs_001pvalue_sorted.bed -b exons_sorted.bed -u > sig_cpg_in_exons.bed
+bedtools intersect -a sig_meth_CpGs_001pvalue_sorted.bed -b UTRs_sorted.bed -u > sig_cpg_in_UTRs.bed
+bedtools intersect -a sig_meth_CpGs_001pvalue_sorted.bed -b five_prime_UTRs_sorted.bed -u > sig_cpg_in_five_prime_UTRs.bed
+bedtools intersect -a sig_meth_CpGs_001pvalue_sorted.bed -b three_prime_UTRs_sorted.bed -u > sig_cpg_in_three_prime_UTRs.bed
+
+# Intronic significant CpGs
+bedtools subtract -a sig_cpg_in_genes_NOdups.bed -b sig_cpg_in_exons.bed -A | \
+bedtools subtract -a - -b sig_cpg_in_UTRs.bed -A | \
+bedtools subtract -a - -b sig_cpg_in_five_prime_UTRs.bed -A | \
+bedtools subtract -a - -b sig_cpg_in_three_prime_UTRs.bed -A > sig_cpg_in_introns.bed
+
+
+
+### Step 8: Count significant CpGs per feature
+
+echo -e "Feature\tCpG_Count" > sig_cpg_counts.txt
+for file in sig_cpg_in_exons.bed sig_cpg_in_five_prime_UTRs.bed sig_cpg_in_three_prime_UTRs.bed sig_cpg_in_UTRs.bed sig_cpg_intergenic.bed sig_cpg_in_introns.bed
+do
+    count=$(wc -l < "$file")
+    echo -e "$(basename $file)\t$count" >> sig_cpg_counts.txt
+done
+
+
+
+### Step 9: Determine total bp length of each genomic feature (then use length to normalize methylated CpG count)
+
+# Calculate feature lengths
+bedtools merge -i exons_sorted.bed | awk '{sum+=$3-$2} END {print sum}' > exon_length.txt
+bedtools merge -i five_prime_UTRs_sorted.bed | awk '{sum+=$3-$2} END {print sum}' > five_prime_UTR_length.txt
+bedtools merge -i three_prime_UTRs_sorted.bed | awk '{sum+=$3-$2} END {print sum}' > three_prime_UTR_length.txt
+bedtools merge -i genes_sorted.bed | awk '{sum+=$3-$2} END {print sum}' > gene_length.txt
+
+# Intergenic length (complement of genes)
+bedtools sort -faidx Dv_genome_V3.1.fa.fai -i genes_sorted.bed > genes_sorted_fixed.bed
+bedtools complement -i genes_sorted_fixed.bed -g Dv_genome_V3.1.fa.fai > intergenic_regions.bed
+bedtools merge -i intergenic_regions.bed | awk '{sum+=$3-$2} END {print sum}' > intergenic_length.txt
+
+
+
+### Calculate intron region length
+
+# Merge exons and UTRs into a single feature set
+cat exons_sorted.bed five_prime_UTRs_sorted.bed three_prime_UTRs_sorted.bed UTRs_sorted.bed \
+  | sort -k1,1 -k2,2n | bedtools merge -i - > exons_utrs_merged.bed
+
+# Subtract exons+UTRs from genes to get intron coordinates
+bedtools subtract -a genes_sorted.bed -b exons_utrs_merged.bed > introns_regions.bed
+
+# Merge overlapping intron intervals and sum total bp
+bedtools merge -i introns_regions.bed | awk '{sum+=$3-$2} END {print sum}' > intron_total_length.txt
+
+
+
+# Combine feature lengths
+echo -e "Feature\tLength(bp)" > genomic_feature_lengths.txt
+echo -e "Genes\t$(cat gene_length.txt)" >> genomic_feature_lengths.txt
+echo -e "Exons\t$(cat exon_length.txt)" >> genomic_feature_lengths.txt
+echo -e "5'UTRs\t$(cat five_prime_UTR_length.txt)" >> genomic_feature_lengths.txt
+echo -e "3'UTRs\t$(cat three_prime_UTR_length.txt)" >> genomic_feature_lengths.txt
+echo -e "Intergenic\t$(cat intergenic_length.txt)" >> genomic_feature_lengths.txt
+echo -e "Introns\t$(cat intron_total_length.txt)" >> genomic_feature_lengths.txt
+
+
+
+
+### Step 10: Make bar plot in R to show where in the genomic CpG methylation occurs
+
+# Activate R in command line/terminal
+R
+
+# Load R libraries
+library(RColorBrewer)
+library(ggplot2)
+library(readxl)
+library(colorspace)
+
+# Read the data
+# Note: the 'sig_meth_CpG_counts_normalized.xlsx' file was created manually by dividing the # methylated CpG (sig_cpg_counts.txt) by feature length (genomic_feature_lengths.txt)
+cpg_data <- read_xlsx("sig_meth_CpG_counts_normalized.xlsx")
+
+
+# Convert Feature column to factor
+cpg_data$Feature <- factor(cpg_data$Feature, levels = cpg_data$Feature)
+
+# Create color palette
+set1_colors <- brewer.pal(7, "BuPu")[-6]
+
+
+# Create bar plot
+ggplot(cpg_data, aes(x=Feature, y=CpG_per_length, fill=Feature)) +
+  geom_bar(stat="identity", color="black") +  # Bar chart instead of pie
+  theme_minimal() +  # Clean theme
+  labs(x="Genomic Feature", y="total number methylated CpG sites",
+       title="") +
+  scale_fill_manual(values=set1_colors) +  # Apply color palette
+  theme(axis.text.x = element_text(angle=45, hjust=1))  # Rotate x-axis labels if needed
+
+
+##

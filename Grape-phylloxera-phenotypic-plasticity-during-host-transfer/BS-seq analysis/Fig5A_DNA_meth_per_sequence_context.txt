@@ -1,0 +1,67 @@
+### Extracting methylation data from bismark coverage files and writing into a single summary file
+
+#!/bin/bash
+
+# Define the directory containing the results
+RESULTS_DIR="/rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/bismark_results_new"
+
+# Output file for extracted methylation data
+OUTPUT_FILE="$RESULTS_DIR/methylation_summary.txt"
+
+# Write header to output file
+echo -e "Sample\tCpG_methylation\tCHG_methylation\tCHH_methylation" > "$OUTPUT_FILE"
+
+# Loop through all Bismark report text files
+find "$RESULTS_DIR" -type f -name "*_report.txt" | while read file; do
+    # Extract sample name from file path
+    sample_name=$(basename "$file" | sed 's/_bismark_bt2_PE_report.txt//')
+
+    # Extract methylation percentages using grep and awk, handling extra spaces
+    cpg=$(grep "C methylated in CpG context" "$file" | awk '{print $(NF)}')
+    chg=$(grep "C methylated in CHG context" "$file" | awk '{print $(NF)}')
+    chh=$(grep "C methylated in CHH context" "$file" | awk '{print $(NF)}')
+
+    # Ensure values were extracted, otherwise set to "NA"
+    cpg=${cpg:-"NA"}
+    chg=${chg:-"NA"}
+    chh=${chh:-"NA"}
+
+    # Append extracted data to the output file
+    echo -e "$sample_name\t$cpg\t$chg\t$chh" >> "$OUTPUT_FILE"
+done
+
+echo "Methylation summary written to $OUTPUT_FILE"
+
+
+
+
+## Make a box plot in R to show DNA methylation per sequence context (CpG, CHH, and CHG)
+
+# Activate R in command line/terminal
+R
+
+# Load required packages
+library(ggplot2)
+library(tidyr)
+library(readr)
+
+# Read the methylation summary file
+methyl_data <- read_tsv("methylation_summary.txt")
+
+# Convert percentages from character to numeric
+methyl_data$CpG_methylation <- as.numeric(sub("%", "", methyl_data$CpG_methylation))
+methyl_data$CHG_methylation <- as.numeric(sub("%", "", methyl_data$CHG_methylation))
+methyl_data$CHH_methylation <- as.numeric(sub("%", "", methyl_data$CHH_methylation))
+
+# Reshape data to long format
+methyl_long <- pivot_longer(methyl_data, cols = c("CpG_methylation", "CHG_methylation", "CHH_methylation"), 
+                            names_to = "Context", values_to = "Methylation_Percentage")
+
+# Create the box plot
+ggplot(methyl_long, aes(x = Context, y = Methylation_Percentage, fill = Context)) +
+  geom_boxplot() +
+  labs(title = "Methylation Levels by Context",
+       x = "Methylation Context",
+       y = "Methylation Percentage") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set1")  # Adjust color scheme
