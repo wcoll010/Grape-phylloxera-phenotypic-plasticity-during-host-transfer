@@ -1,0 +1,717 @@
+### Process the coverage files (which contain CpG methylation data from bismark) to calculate gene-level methylation levels 
+### then perform differential methylation analysis with methylKit R package
+
+
+# Step 1: make the gene level cov files for the PA samples (these are only the adults samples, but the same code was use to process all samples after changing file paths)
+
+# move files to a new directory named 'PA_coverage_files'
+mv PA2_1_val_1_bismark_bt2_pe_dedup.deduplicated.bismark.cov.gz \
+PA3_1_val_1_bismark_bt2_pe_dedup.deduplicated.bismark.cov.gz \
+PA4_1_val_1_bismark_bt2_pe_dedup.deduplicated.bismark.cov.gz \
+PA5_1_val_1_bismark_bt2_pe_dedup.deduplicated.bismark.cov.gz PA_coverage_files
+
+
+
+
+# Step 2: Annotate gene level methylation
+
+#!/bin/bash
+
+# Load the necessary module
+module load bedtools/2.30.0
+
+# Define paths
+ANNOTATION_FILE="/rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/gene_annotations_sorted.bed"
+INPUT_DIR="/rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/PA_coverage_files"
+OUTPUT_DIR="/rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/PA_coverage_files"
+
+# Create output directory if it doesn't exist
+mkdir -p "$OUTPUT_DIR"
+
+# Loop through all .cov.gz files
+for FILE in "$INPUT_DIR"/*.cov.gz; do
+    # Extract the sample name (removing directory and suffix)
+    BASENAME=$(basename "$FILE" .deduplicated.bismark.cov.gz)
+    
+    echo "Processing $BASENAME..."
+
+    # Step 1: Annotate coverage file with gene IDs
+    bedtools intersect -wa -wb \
+        -a <(zcat "$FILE") \
+        -b "$ANNOTATION_FILE" \
+        | cut -f1-6,10 > "$OUTPUT_DIR/${BASENAME}_annotated_genes.bed"
+
+    # Step 2: Sum methylation data per gene
+    awk '{
+        meth[$7] += $5;   # Sum methylated reads per gene
+        unmeth[$7] += $6; # Sum unmethylated reads per gene
+    } 
+    END {
+        for (gene in meth) {
+            total = meth[gene] + unmeth[gene];  
+            if (total > 0) {
+                percent = (meth[gene] / total) * 100;
+            } else {
+                percent = 0;
+            }
+            print gene, meth[gene], unmeth[gene], percent;
+        }
+    }' "$OUTPUT_DIR/${BASENAME}_annotated_genes.bed" > "$OUTPUT_DIR/${BASENAME}_gene_level_meth.bed"
+
+    # Step 3: Merge with gene annotation file, format like the .cov file
+    awk 'NR==FNR {start[$4] = $2; stop[$4] = $3; next} 
+         ($1 in start) {print $1, start[$1], stop[$1], $4, $2, $3}' \
+         "$ANNOTATION_FILE" "$OUTPUT_DIR/${BASENAME}_gene_level_meth.bed" \
+         > "$OUTPUT_DIR/merged_${BASENAME}_gene_level_meth.cov"
+
+    echo "Finished processing $BASENAME"
+done
+
+echo "All files processed!"
+
+# save the above script to the file 'PA_meth_gene_annotation.sh'
+# submit the above code as shell script / bash job
+sbatch --partition=epyc --mem=100g --cpus-per-task=4 --time=01:00:00 PA_meth_gene_annotation.sh
+
+
+
+# Step 3: Rewrite all gene meth coverage files as sorted and tab delimited 
+
+cd /rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/processed
+
+for file in merged_*_gene_level_meth.cov; do
+    output_file="${file/merged_/}"  # Remove "merged_" prefix
+    output_file="${output_file%.cov}_tab.cov"  # Append "_tab" before ".cov"
+    awk '{OFS="\t"; print $1, $2, $3, $4, $5, $6}' "$file" > "$output_file"
+    echo "Processed: $file -> $output_file"
+done
+
+
+# sort the coverage files 
+cd /rhome/wcoll010/shared/Project_PNAZ_Nova723P_Zafar/epigen/ucdavis/coverage_files_R_script/processed
+
+for file in *.cov; do
+    echo "Sorting $file..."
+    sort -k1,1 -k2,2 -k3,3n "$file" -o "$file"
+done
+
+echo "Sorting completed!"
+
+# Step 4: now submit R script for methylkit, compare all host-by-host contrasts for diff methylation at the gene level
+
+#!/bin/bash
+#SBATCH --job-name=methylKit_allVSall_samples_minusG1_job
+#SBATCH --output=methylKit_job_output_all_samples_minusG1.txt
+#SBATCH --time=3:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=100G
+#SBATCH --mail-user=wcoll010@ucr.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name="methylKit_all_samples_minusG1"
+#SBATCH -p epyc
+
+
+
+# Load R module (adjust this based on your HPC environment)
+module load R
+
+# Run the R script
+Rscript gene_meth_allvsS04.R
+
+
+
+# Below is the R script from 'gene_meth_allvsS04.R' for Step 4 above
+
+library(methylKit)
+# controast: 1103 vs S04 
+file.list <- list("11_1_S18_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_2_S19_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_3_S20_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_4_S21_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_1_S14_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_2_S15_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_3_S16_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_4_S17_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov")
+
+# read the listed files into a methylRawList object 
+myobj <- methRead(file.list,
+                  sample.id=list("11_1","11_2","11_3","11_4",
+                  "S04_1","S04_2","S04_3","S04_4"), 
+                  pipeline = "bismarkCoverage",
+                  assembly="OGS3.2_20180216.gff3",
+                  treatment=c(1,1,1,1,0,0,0,0),
+                  mincov = 20)
+                  
+# check number of samples
+myobj
+
+# filter object based on coverages , 20 is low ; remove the top 0.2 % for excessive PCR duplication
+myobj.filt <- filterByCoverage(myobj,
+                               lo.count=20,
+                               lo.perc=NULL,
+                               hi.count=NULL,
+                               hi.perc=99.8)
+
+# normalization step: scaling factor derived from differences between the median of the coverage distributions
+myobj.filt.norm <- normalizeCoverage(myobj.filt, method = "median")
+
+# merge data: collect only bases/Cs that are covered by reads in all samples
+meth <- unite(myobj.filt.norm)
+
+pm=percMethylation(meth)
+
+# calculate standard deviation of gene level methylation
+sds=matrixStats::rowSds(pm)
+
+# Visualize the distribution of the per-gene standard deviation
+# to determine a suitable cutoff
+pdf("hist_S04vsG1.pdf")
+hist(sds, breaks = 100)
+dev.off()
+
+
+# keep only gene with standard deviations larger than 2%
+meth <- meth[sds > 2]
+
+# This leaves us with this number of genes
+nrow(meth)
+
+# hierarchical clustering of distance measures derived from each samples’ percentage methylation.
+pdf("hclust_1103vsS04.pdf")
+clusterSamples(meth, plot=TRUE)
+dev.off()
+
+# principal component 
+pdf("PCA_1103vsS04.pdf")
+PCASamples(meth)
+dev.off()
+
+# Test for differential methylation... This might take a few minutes.
+myDiff <- calculateDiffMeth(meth,
+                            overdispersion = "MN",
+                            adjust="BH")
+
+
+# Save differential methylation overview per chromosome to a PDF
+pdf("diffMethPerChr_1103vsS04.pdf")
+diffMethPerChr(myDiff)
+dev.off()
+
+
+# get all differentially methylated bases and order by qvalue
+myDiff10p <- getMethylDiff(myDiff,
+                           difference=10,
+                           qvalue=0.05)
+myDiff10p <- myDiff10p[order(myDiff10p$qvalue),]
+
+write.csv(myDiff, file = "myDiff_1103vsS04.csv", row.names = TRUE)
+
+
+
+# 101_14 vs S04 
+file.list <- list("14_1_S6_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_2_S7_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_3_S8_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_4_S9_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_1_S14_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_2_S15_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_3_S16_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_4_S17_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov")
+
+# read the listed files into a methylRawList object making sure the other parameters are filled in correctly.
+myobj <- methRead(file.list,
+                  sample.id=list("101_14_1","101_14_2","101_14_3","101_14_4",
+                  "S04_1","S04_2","S04_3","S04_4"), 
+                  pipeline = "bismarkCoverage",
+                  assembly="OGS3.2_20180216.gff3",
+                  treatment=c(1,1,1,1,0,0,0,0),
+                  mincov = 20)
+                  
+# check number of samples
+myobj
+
+# filter object based on coverages , 20 is low ; remove the top 0.2 % for excessive duplication
+myobj.filt <- filterByCoverage(myobj,
+                               lo.count=20,
+                               lo.perc=NULL,
+                               hi.count=NULL,
+                               hi.perc=99.8)
+
+# normalization step: scaling factor derived from differences between the median of the coverage distributions
+myobj.filt.norm <- normalizeCoverage(myobj.filt, method = "median")
+
+meth <- unite(myobj.filt.norm)
+
+pm=percMethylation(meth)
+
+# calculate standard deviation of gene level methylation
+sds=matrixStats::rowSds(pm)
+
+# Visualize the distribution of the per-gene standard deviation
+# to determine a suitable cutoff
+pdf("hist_101_14vsS04.pdf")
+hist(sds, breaks = 100)
+dev.off()
+
+
+# keep only gene with standard deviations larger than 2%
+meth <- meth[sds > 2]
+
+# This leaves us with this number of genes
+nrow(meth)
+
+
+#hierarchical clustering of distance measures derived from each samples’ percentage methylation.
+pdf("hclust_101_14vsS04.pdf")
+clusterSamples(meth, plot=TRUE)
+dev.off()
+
+# principal component 
+pdf("PCA_101_14vsS04.pdf")
+PCASamples(meth)
+dev.off()
+
+# Test for differential methylation... This might take a few minutes.
+myDiff <- calculateDiffMeth(meth,
+                            overdispersion = "MN",
+                            adjust="BH")
+
+
+# Save differential methylation overview per chromosome to a PDF
+pdf("diffMethPerChr_101_14vsS04.pdf")
+diffMethPerChr(myDiff)
+dev.off()
+
+# get all differentially methylated bases and order by qvalue
+myDiff10p <- getMethylDiff(myDiff,
+                           difference=10,
+                           qvalue=0.05)
+myDiff10p <- myDiff10p[order(myDiff10p$qvalue),]
+
+write.csv(myDiff, file = "myDiff_101_14vsS04.csv", row.names = TRUE)
+
+
+
+# 99R vs S04 
+file.list <- list("9R_1_S10_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_2_S11_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_3_S12_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_4_S13_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_1_S14_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_2_S15_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_3_S16_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_4_S17_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov")
+
+# read the listed files into a methylRawList object making sure the other parameters are filled in correctly.
+myobj <- methRead(file.list,
+                  sample.id=list("99R_1","99R_2","99R_3","99R_4",
+                  "S04_1","S04_2","S04_3","S04_4"), 
+                  pipeline = "bismarkCoverage",
+                  assembly="OGS3.2_20180216.gff3",
+                  treatment=c(1,1,1,1,0,0,0,0),
+                  mincov = 20)
+                  
+# check number of samples
+myobj
+
+# filter object based on coverages , 20 is low ; remove the top 0.2 % for excessive duplication
+myobj.filt <- filterByCoverage(myobj,
+                               lo.count=20,
+                               lo.perc=NULL,
+                               hi.count=NULL,
+                               hi.perc=99.8)
+# normalization step: scaling factor derived from differences between the median of the coverage distributions
+myobj.filt.norm <- normalizeCoverage(myobj.filt, method = "median")
+meth <- unite(myobj.filt.norm)
+pm=percMethylation(meth)
+
+# calculate standard deviation of gene level methylation
+sds=matrixStats::rowSds(pm)
+
+# Visualize the distribution of the per-gene standard deviation
+# to determine a suitable cutoff
+pdf("hist_99RvsS04.pdf")
+hist(sds, breaks = 100)
+dev.off()
+
+
+# keep only gene with standard deviations larger than 2%
+meth <- meth[sds > 2]
+
+# This leaves us with this number of genes
+nrow(meth)
+
+
+#hierarchical clustering of distance measures derived from each samples’ percentage methylation.
+pdf("hclust_99RvsS04.pdf")
+clusterSamples(meth, plot=TRUE)
+dev.off()
+
+# principal component 
+pdf("PCA_99RvsS04.pdf")
+PCASamples(meth)
+dev.off()
+
+# Test for differential methylation... This might take a few minutes.
+myDiff <- calculateDiffMeth(meth,
+                            overdispersion = "MN",
+                            adjust="BH")
+
+
+# Save differential methylation overview per chromosome to a PDF
+pdf("diffMethPerChr_99RvsS04.pdf")
+diffMethPerChr(myDiff)
+dev.off()
+
+
+# get all differentially methylated bases and order by qvalue
+myDiff10p <- getMethylDiff(myDiff,
+                           difference=10,
+                           qvalue=0.05)
+myDiff10p <- myDiff10p[order(myDiff10p$qvalue),]
+
+write.csv(myDiff, file = "myDiff_99RvsS04.csv", row.names = TRUE)
+
+
+
+
+## 1103 vs 101_14
+
+file.list <- list("11_1_S18_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_2_S19_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_3_S20_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_4_S21_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_1_S6_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_2_S7_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_3_S8_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_4_S9_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov")
+
+# read the listed files into a methylRawList object making sure the other parameters are filled in correctly.
+myobj <- methRead(file.list,
+                  sample.id=list("11_1","11_2","11_3","11_4",
+                  "101_14_1","101_14_2","101_14_3","101_14_4"), 
+                  pipeline = "bismarkCoverage",
+                  assembly="OGS3.2_20180216.gff3",
+                  treatment=c(1,1,1,1,0,0,0,0),
+                  mincov = 20)
+                  
+# check number of samples
+myobj
+
+# filter object based on coverages , 20 is low ; remove the top 0.2 % for excessive duplication
+myobj.filt <- filterByCoverage(myobj,
+                               lo.count=20,
+                               lo.perc=NULL,
+                               hi.count=NULL,
+                               hi.perc=99.8)
+
+# normalization step: scaling factor derived from differences between the median of the coverage distributions
+myobj.filt.norm <- normalizeCoverage(myobj.filt, method = "median")
+meth <- unite(myobj.filt.norm)
+pm=percMethylation(meth)
+
+# calculate standard deviation of gene level methylation
+sds=matrixStats::rowSds(pm)
+
+# Visualize the distribution of the per-gene standard deviation
+# to determine a suitable cutoff
+pdf("hist_1103vs101_14.pdf")
+hist(sds, breaks = 100)
+dev.off()
+
+
+# keep only gene with standard deviations larger than 2%
+meth <- meth[sds > 2]
+
+# This leaves us with this number of genes
+nrow(meth)
+
+#hierarchical clustering of distance measures derived from each samples’ percentage methylation.
+pdf("hclust_1103vs101_14.pdf")
+clusterSamples(meth, plot=TRUE)
+dev.off()
+
+# principal component 
+pdf("PCA_1103vs101_14.pdf")
+PCASamples(meth)
+dev.off()
+
+# Test for differential methylation... This might take a few minutes.
+myDiff <- calculateDiffMeth(meth,
+                            overdispersion = "MN",
+                            adjust="BH")
+
+# Save differential methylation overview per chromosome to a PDF
+pdf("diffMethPerChr_1103vs101_14.pdf")
+diffMethPerChr(myDiff)
+dev.off()
+
+
+
+# get all differentially methylated bases and order by qvalue
+myDiff10p <- getMethylDiff(myDiff,
+                           difference=10,
+                           qvalue=0.05)
+myDiff10p <- myDiff10p[order(myDiff10p$qvalue),]
+
+write.csv(myDiff, file = "myDiff_1103vs101_14.csv", row.names = TRUE)
+
+
+
+
+
+## 1103 vs 99R
+
+file.list <- list("11_1_S18_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_2_S19_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_3_S20_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_4_S21_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_1_S10_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_2_S11_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_3_S12_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_4_S13_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov")
+
+# read the listed files into a methylRawList object making sure the other parameters are filled in correctly.
+myobj <- methRead(file.list,
+                  sample.id=list("11_1","11_2","11_3","11_4",
+                  "99R_1","99R_2","99R_3","99R_4"), 
+                  pipeline = "bismarkCoverage",
+                  assembly="OGS3.2_20180216.gff3",
+                  treatment=c(1,1,1,1,0,0,0,0),
+                  mincov = 20)
+                  
+# check number of samples
+myobj
+
+# filter object based on coverages , 20 is low ; remove the top 0.2 % for excessive duplication
+myobj.filt <- filterByCoverage(myobj,
+                               lo.count=20,
+                               lo.perc=NULL,
+                               hi.count=NULL,
+                               hi.perc=99.8)
+# normalization step: scaling factor derived from differences between the median of the coverage distributions
+myobj.filt.norm <- normalizeCoverage(myobj.filt, method = "median")
+meth <- unite(myobj.filt.norm)
+pm=percMethylation(meth)
+
+# calculate standard deviation of gene level methylation
+sds=matrixStats::rowSds(pm)
+
+# Visualize the distribution of the per-gene standard deviation
+# to determine a suitable cutoff
+pdf("hist_1103vs99R.pdf")
+hist(sds, breaks = 100)
+dev.off()
+
+
+# keep only gene with standard deviations larger than 2%
+meth <- meth[sds > 2]
+
+# This leaves us with this number of genes
+nrow(meth)
+
+#hierarchical clustering of distance measures derived from each samples’ percentage methylation.
+pdf("hclust_1103vs99R.pdf")
+clusterSamples(meth, plot=TRUE)
+dev.off()
+
+# principal component 
+pdf("PCA_1103vs99R.pdf")
+PCASamples(meth)
+dev.off()
+
+# Test for differential methylation... This might take a few minutes.
+myDiff <- calculateDiffMeth(meth,
+                            overdispersion = "MN",
+                            adjust="BH")
+
+
+# Save differential methylation overview per chromosome to a PDF
+pdf("diffMethPerChr_1103vs99R.pdf")
+diffMethPerChr(myDiff)
+dev.off()
+
+
+
+# get all differentially methylated bases and order by qvalue
+myDiff10p <- getMethylDiff(myDiff,
+                           difference=10,
+                           qvalue=0.05)
+myDiff10p <- myDiff10p[order(myDiff10p$qvalue),]
+
+write.csv(myDiff, file = "myDiff_1103vs99R.csv", row.names = TRUE)
+
+
+
+## 101_14 vs 99R
+
+file.list <- list("14_1_S6_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_2_S7_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_3_S8_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_4_S9_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_1_S10_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_2_S11_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_3_S12_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_4_S13_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov")
+
+# read the listed files into a methylRawList object making sure the other parameters are filled in correctly.
+myobj <- methRead(file.list,
+                  sample.id=list("101_14_1","101_14_2","101_14_3","101_14_4",
+                  "99R_1","99R_2","99R_3","99R_4"), 
+                  pipeline = "bismarkCoverage",
+                  assembly="OGS3.2_20180216.gff3",
+                  treatment=c(1,1,1,1,0,0,0,0),
+                  mincov = 20)
+                  
+# check number of samples
+myobj
+
+# filter object based on coverages , 20 is low ; remove the top 0.2 % for excessive duplication
+myobj.filt <- filterByCoverage(myobj,
+                               lo.count=20,
+                               lo.perc=NULL,
+                               hi.count=NULL,
+                               hi.perc=99.8)
+# normalization step: scaling factor derived from differences between the median of the coverage distributions
+myobj.filt.norm <- normalizeCoverage(myobj.filt, method = "median")
+meth <- unite(myobj.filt.norm)
+pm=percMethylation(meth)
+
+# calculate standard deviation of gene level methylation
+sds=matrixStats::rowSds(pm)
+
+# Visualize the distribution of the per-gene standard deviation
+# to determine a suitable cutoff
+pdf("hist_101_14vs99R.pdf")
+hist(sds, breaks = 100)
+dev.off()
+
+
+# keep only gene with standard deviations larger than 2%
+meth <- meth[sds > 2]
+
+# This leaves us with this number of genes
+nrow(meth)
+
+#hierarchical clustering of distance measures derived from each samples’ percentage methylation.
+pdf("hclust_101_14vs99R.pdf")
+clusterSamples(meth, plot=TRUE)
+dev.off()
+
+# principal component 
+pdf("PCA_101_14vs99R.pdf")
+PCASamples(meth)
+dev.off()
+
+# Test for differential methylation... This might take a few minutes.
+myDiff <- calculateDiffMeth(meth,
+                            overdispersion = "MN",
+                            adjust="BH")
+
+# Save differential methylation overview per chromosome to a PDF
+pdf("diffMethPerChr_101_14vs99R.pdf")
+diffMethPerChr(myDiff)
+dev.off()
+
+# get all differentially methylated bases and order by qvalue
+myDiff10p <- getMethylDiff(myDiff,
+                           difference=10,
+                           qvalue=0.05)
+myDiff10p <- myDiff10p[order(myDiff10p$qvalue),]
+
+
+write.csv(myDiff, file = "myDiff_101_14vs99R.csv", row.names = TRUE)
+
+
+### all samples, to create a PCA and cluster dendrogram
+file.list <- list("PA2_1_val_1_bismark_bt2_pe_dedup_gene_level_meth_tab.cov",
+"PA3_1_val_1_bismark_bt2_pe_dedup_gene_level_meth_tab.cov",
+"PA4_1_val_1_bismark_bt2_pe_dedup_gene_level_meth_tab.cov",
+"PA5_1_val_1_bismark_bt2_pe_dedup_gene_level_meth_tab.cov",
+"PE2_1_val_1_bismark_bt2_pe_dedup_gene_level_meth_tab.cov",
+"PE3_1_val_1_bismark_bt2_pe_dedup_gene_level_meth_tab.cov",
+"PE4_1_val_1_bismark_bt2_pe_dedup_gene_level_meth_tab.cov",
+"PE5_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_1_S14_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_2_S15_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_3_S16_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"S4_4_S17_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_1_S6_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_2_S7_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_3_S8_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"14_4_S9_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"G1_1_S2_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"G1_2_S3_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"G1_3_S4_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"G1_4_S5_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_1_S18_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_2_S19_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_3_S20_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"11_4_S21_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_1_S10_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_2_S11_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_3_S12_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov",
+"9R_4_S13_L003_1_val_1_bismark_bt2_pe_gene_level_meth_tab.cov")
+
+
+# read the listed files into a methylRawList object making sure the other parameters are filled in correctly.
+myobj <- methRead(file.list,
+                  sample.id=list("G0_Ad_2","G0_Ad_3","G0_Ad_4","G0_Ad_5",
+                                 "G0_Egg_2","G0_Egg_3","G0_Egg_4","G0_Egg_5",
+                                 "S04_1","S04_2","S04_3","S04_4",
+                                 "101_14_1","101_14_2","101_14_3","101_14_4",
+                                 "G1_1","G1_2","G1_3","G1_4",
+                                 "11_1","11_2","11_3","11_4",
+                                 "99R_1","99R_2","99R_3","99R_4"), 
+                  pipeline = "bismarkCoverage",
+                  assembly="OGS3.2_20180216.gff3",
+                  treatment=c(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6),
+                  mincov = 20)
+                  
+# check number of samples
+myobj
+
+# filter object based on coverages , 20 is low ; remove the top 0.2 % for excessive duplication
+myobj.filt <- filterByCoverage(myobj,
+                               lo.count=20,
+                               lo.perc=NULL,
+                               hi.count=NULL,
+                               hi.perc=99.8)
+# normalization step: scaling factor derived from differences between the median of the coverage distributions
+myobj.filt.norm <- normalizeCoverage(myobj.filt, method = "median")
+meth <- unite(myobj.filt.norm)
+pm=percMethylation(meth)
+
+# calculate standard deviation of gene level methylation
+sds=matrixStats::rowSds(pm)
+
+# Visualize the distribution of the per-gene standard deviation
+# to determine a suitable cutoff
+pdf("hist_all_samples.pdf")
+hist(sds, breaks = 100)
+dev.off()
+
+
+# keep only gene with standard deviations larger than 2%
+meth <- meth[sds > 2]
+
+# This leaves us with this number of genes
+nrow(meth)
+
+
+#hierarchical clustering of distance measures derived from each samples’ percentage methylation.
+pdf("hclust_all_samples.pdf")
+clusterSamples(meth, plot=TRUE)
+dev.off()
+
+# principal component 
+pdf("PCA_all_samples.pdf")
+PCASamples(meth)
+dev.off()
+
+###
+
+
+
+
