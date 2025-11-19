@@ -57,7 +57,7 @@ KO_enrichment_results <- enricher(DEG_KO_vector, TERM2GENE=KO_universe, pvalueCu
 
 ?enricher
 
-# make a simple dot plot of the results and save it as a .tiff file
+# make a simple dot plot of the results and save it as a .pdf file
 pdf(file="KO_enrich_DOWN_DEGvsCab33_1.5fc_dotplot.pdf",width=6,height=4)
 dotplot(KO_enrichment_results, showCategory=100)
 dev.off()
