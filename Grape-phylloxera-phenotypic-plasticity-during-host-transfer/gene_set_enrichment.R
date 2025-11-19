@@ -42,6 +42,16 @@ DEG_KOs <- DEG_list_KO_merged[c(1,35)] # get only gene name and KEGG term for ne
 # get gene vector for DEG KOs
 DEG_KO_vector <- DEG_KOs$ID
 
+# create KEGG background object (all genes and KEGG terms, ie KEGG universe)
+KO_universe <- eggnog_data[c(1,12)]
+
+KO_universe$KEGG_ko <- gsub( "ko:", "", as.character(KO_universe$KEGG_ko))
+
+# expand data frames so each KO term in a unique row
+KO_universe <- separate_rows(KO_universe, KEGG_ko, sep = ",")
+KO_universe <- KO_universe[,c(2,1)]
+
+
 # run clusterProfiler KEGG enrichment
 KO_enrichment_results <- enricher(DEG_KO_vector, TERM2GENE=KO_universe, pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, minGSSize = 10)
 
